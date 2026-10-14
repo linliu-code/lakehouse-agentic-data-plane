@@ -1,65 +1,58 @@
 # RFC 0001: Agent cost is a data plane problem
 
-- **Status:** Draft
+- **Status:** Draft (v1)
 - **Author:** Lin Liu
 - **Created:** 2026-10-14
 
-## Summary
+## Problem
 
-When an agent answers a question or completes a task over lakehouse data, the bill is
-driven less by model tokens than by the data work underneath: scans, joins, repeated
-exploratory queries, and data copied out of the lakehouse into the agent's context.
-This RFC argues that agent cost should be treated as a data plane concern — measured,
-bounded, and optimized where the data lives — rather than as a prompt- or model-tuning
-concern.
+A single agent task fans out into N queries and scans. Nobody sees what that cost until
+the bill arrives at the end of the month — long after the task, the agent that ran it,
+and the reason it ran are gone.
 
-## Motivation
+## Why existing approaches fall short
 
-Agents differ from human analysts and from scheduled pipelines in three ways that matter
-for cost:
+**They look after the fact.** Tracing, LLM observability, and FinOps tooling all observe
+spend once it has happened. At best they alert; none of them can stop a read while it is
+executing.
 
-1. **They explore.** An agent issues many speculative queries (schema probes, samples,
-   retries after a wrong guess) before the one that answers the task.
-2. **They repeat.** Similar tasks re-derive the same intermediate results, because the
-   agent keeps no durable memory of what it already computed.
-3. **They pull data toward the model.** Results are materialized into context windows,
-   which means data leaves the engine that could have filtered, aggregated, or skipped it.
+**Tokens are the tip of the iceberg.** Token cost is the part that is easy to see. The
+expensive part sits underneath it: query scans, data egress, and the same data read
+again and again across agent steps and tasks.
 
-Each of these multiplies data-plane work per task. None of them is addressed by a
-cheaper model or a shorter prompt.
+## Proposal
 
-## Thesis
+Put cost control on the data access path, and do three things at execution time:
 
-Agent cost = model cost + data cost, and for data-heavy tasks the data term is the one
-that scales with table size and task count. It is therefore controlled by data-plane
-mechanisms:
+1. **Tag every read with an identity** — the agent, the task, and the intent behind it.
+2. **Set budgets at table, partition, and snapshot level** — where the data actually lives.
+3. **Degrade when a budget is exceeded** — answer from a sample, serve from cache, or
+   refuse the read.
 
-- **Read less:** pruning, file/row-group skipping, indexes, and pushdown applied to
-  agent-issued queries, not only to hand-written ones.
-- **Recompute less:** reuse of intermediate results across agent steps and across tasks
-  (incremental reads, materialized and cached results with lakehouse-native freshness).
-- **Move less:** push computation to the engine and return the smallest answer the agent
-  needs, instead of rows into context.
-- **Bound it:** per-task data budgets (bytes scanned, queries issued) enforced by the
-  data plane, with attribution so cost is visible per agent and per task.
+## Why it has to be the data plane
 
-## Non-goals
-
-- Choosing or tuning a specific model.
-- Prompt engineering techniques for reducing token count.
-- A specific query engine or table format; the argument applies to the lakehouse layer
-  generally.
+Only the data plane knows all three of: **what** was read, **how much** was read, and
+**who** read it. The model layer knows who but not what; the bill knows how much but not
+who or why. Enforcement needs all three in the same place at the same moment.
 
 ## Open questions
 
-- How much of a typical agent task's cost is data cost versus model cost? This RFC does
-  not yet have measurements; quantifying the split is the first follow-up.
-- What is the right unit for a per-task data budget — bytes scanned, compute-seconds, or
-  queries?
-- Where should reuse live: in the engine's cache, in the table format's metadata, or in
-  an agent-facing layer above both?
+These are points the author is not sure about. Arguments against them are wanted.
 
-## Next steps
-
-Follow-up RFCs will take each mechanism above (read less, recompute less, move less,
-bound it) and propose a concrete design.
+1. **Is the iceberg real?** This RFC asserts that data cost dominates token cost for
+   agent tasks, but has no measurements. If, for typical tasks, tokens are the larger
+   share, the case for putting control in the data plane gets much weaker.
+2. **Can intent be trusted?** If the agent declares its own intent, it can be wrong or
+   can game the tag to get a bigger budget. If the orchestrator assigns it, the tag may
+   be too coarse to be useful. Is identity (agent + task) enough without intent?
+3. **Check before the read, or during it?** Pre-execution estimates from table metadata
+   can be badly off; aborting mid-scan throws away work already paid for. Which one is
+   the budget actually enforced on, and how wrong can the estimate be before the budget
+   is meaningless?
+4. **Is degradation safe?** A sampled or cached answer is a different answer. An agent
+   may act on it as if it were exact. Does every degraded result need to be labelled —
+   and will agents actually honour the label?
+5. **Is the data plane really the only place?** Query engines already have workload
+   management (resource groups, quotas), and agents holding storage credentials can read
+   files without going through any enforcement point. Where the data plane can be
+   bypassed, the "only this layer knows" argument does not hold.
