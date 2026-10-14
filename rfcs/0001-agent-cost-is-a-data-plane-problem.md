@@ -10,6 +10,38 @@ A single agent task fans out into N queries and scans. Nobody sees what that cos
 the bill arrives at the end of the month — long after the task, the agent that ran it,
 and the reason it ran are gone.
 
+## Why now
+
+Data plane architecture mirrors the relationships between the people around it. Today
+those relationships are:
+
+- application engineers who own the operational sources,
+- a data infra team that owns the platform and the pipelines,
+- the customer's data engineers, who consume what lands at the end.
+
+CDC and ETL pipelines are the **contract between these teams**. A pipeline is reviewed,
+scheduled, owned, and versioned precisely because someone else sits on the other side
+of it. As a side effect, the pipeline also bounded cost: planned work has a predictable
+cost and an owner, and the infra team could plan capacity for it.
+
+Agents collapse that handoff. A data engineer with an agent can explore, transform, and
+write data directly, which pulls toward less ETL or none, and toward faster reads and
+writes.
+
+Agents remove only the *coordination* reason for ETL, not the physical ones. Sources
+still need protecting from analytical load, data still needs reshaping for fast reads,
+history still needs keeping, and computing once to read many times still pays. So ETL
+does not disappear; it changes who writes it and when — from pipelines people author
+ahead of time to transformations agents generate, or the data plane materializes after
+watching what agents keep reading.
+
+What does disappear is the pipeline as the place where cost, quality, and isolation were
+guaranteed. The same work becomes unplanned agent work: fan-out reads over raw data,
+small direct writes, transformations recomputed per task. Those guarantees have to move
+somewhere, and the only layer left between the customer's agents and the infra team is
+the data plane. **Budgets and policies in the data plane become the new contract**,
+replacing the pipeline.
+
 ## Definitions
 
 "Agentic data plane" is not an established term. This RFC uses the following meanings.
@@ -58,12 +90,47 @@ Not yet measured; this table is the working model this RFC argues from.
 | Ingestion | Rarely moves data itself, but may *create a pipeline* | Creates pipelines after review | One agent decision becomes a recurring cost |
 | Concurrency | Parallel sub-agents, unattended, around the clock | Business hours, one at a time | Nobody is watching at spike time; only runtime enforcement helps |
 
-Two kinds of cost in this table are invisible at read time:
+### Agents, writers, and transactions
+
+These sit at three different layers, and agents have no counterpart in the table format.
+
+| | Transaction | Writer | Agent |
+|---|---|---|---|
+| Layer | Table format | Table format + process | Application / orchestration |
+| Unit | One atomic commit (an instant / a snapshot) | A process committing to a table, possibly alongside others | A reasoning actor that reads and writes over many steps |
+| What makes it safe | Single-commit atomicity, per table (multi-table only where the catalog supports it) | Concurrency control: optimistic, with locks and per-file-group conflict detection; non-blocking variants for merge-on-read | Nothing today — no format or engine knows what an agent task is |
+| Lifetime | Seconds to minutes | A job | Minutes to hours, unattended |
+| Identity | Instant time / snapshot id | Writer config / lock owner | Agent + task + intent |
+
+One agent task makes many commits, often across several tables, often through a shared
+writer service. An agent is not a writer, and a task is not a transaction. The gaps:
+
+- **No task-scoped transaction.** If a task fails halfway, its earlier commits stay.
+  Table-level restore and rollback would also undo other writers' work. Branches or
+  compensating writes are the candidates; both cost storage and a later merge.
+- **Optimistic concurrency assumes rare conflicts.** Parallel sub-agents converge on the
+  same hot partitions, and every conflict means the whole write is redone.
+- **Inconsistent reads.** Steps of one task, or cooperating agents, can each read a
+  different snapshot. Pinning one snapshot per task fixes this, but a pinned snapshot
+  keeps old files from being cleaned.
+- **Locks and commits don't know the agent.** When many agents share one writer, a
+  conflict or lock-wait spike cannot be traced to the agent that caused it.
+- **Table services are writers too.** More small agent writes mean both more
+  table-service work and more conflicts between table services and agents.
+
+Whether an agentic data plane needs task-scoped transactions as a primitive is left open.
+
+### Costs invisible at read time
+
+The table and the gaps above produce five kinds of cost that a read-only budget misses:
 
 - **Deferred cost:** table-service work triggered by an agent's writes.
 - **Recurring cost:** pipelines and materializations an agent created.
+- **Wasted work:** commits aborted on conflict and redone.
+- **Cleanup cost:** what a half-finished task leaves behind.
+- **Isolation cost:** storage held by pinned snapshots or task branches.
 
-A design that only budgets reads misses both, so they are in scope here.
+All five are in scope here.
 
 ## Why existing approaches fall short
 
@@ -108,12 +175,14 @@ enforces and measures**, and a **ledger attributes**.
    gets an alert, but an agent can read a machine-readable refusal and rewrite its
    query, so enforcement steers instead of only blocking.
 5. **Per-task ledger.** Bytes scanned, files opened, egress bytes, and compute-seconds
-   per task, joined by task id with token cost from the AI gateway, so one record shows
-   the whole cost of a task.
-6. **Attributing deferred and recurring cost.** Writes record the task id in commit
-   metadata. Later table-service runs are attributed back in proportion to the files
-   each task produced. Pipelines an agent creates inherit its task or owner id, so their
-   recurring cost is never orphaned.
+   per task — including work spent on commits that were aborted and redone — joined by
+   task id with token cost from the AI gateway, so one record shows the whole cost of a
+   task.
+6. **Attributing deferred, recurring, and isolation cost.** Writes record the task id in
+   commit metadata. Later table-service runs are attributed back in proportion to the
+   files each task produced. Pipelines an agent creates inherit its task or owner id, so
+   their recurring cost is never orphaned. Snapshots or branches pinned for a task are
+   charged to that task until released.
 
 ## Why it has to be the data plane
 

@@ -15,6 +15,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   scope, and a design sketch (identity propagation, policy in catalog, two-stage
   enforcement, degradation ladder with "narrow your query" feedback, per-task ledger,
   attribution of deferred cost). Open questions 3 and 5 sharpened.
+- RFC 0001: added "Why now" (pipelines as the contract between teams; agents collapse
+  the handoff; the data plane becomes the new contract) and "Agents, writers, and
+  transactions", widening read-invisible cost to five kinds (deferred, recurring,
+  wasted, cleanup, isolation); ledger and attribution updated to match.
 
 ### Added
 - README with the one-sentence thesis.
